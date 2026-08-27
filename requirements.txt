@@ -1,5 +1,8 @@
 python-telegram-bot==20.7
-SQLAlchemy==2.0.25
+SQLAlchemy>=2.0.30
 psycopg2-binary==2.9.9
 geopy==2.4.1
 apscheduler==3.10.4
+Flask==3.0.0
+gunicorn==21.2.0
+
