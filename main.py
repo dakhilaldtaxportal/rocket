@@ -1,390 +1,377 @@
 import logging
 import asyncio
-from flask import Flask
-from threading import Thread
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime
+from geopy.distance import geodesic
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, 
-    MessageHandler, filters, ContextTypes, ConversationHandler
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters, ConversationHandler
 )
+from database import SessionLocal, init_db, Vendor, Rider, DeliveryRequest, Admin
 
-from config import BOT_TOKEN, ADMIN_ID, NORMAL_RADIUS_KM, BROADCAST_RADIUS_KM, REQUEST_TIMEOUT
-from database import init_db, get_connection, calculate_distance, get_nearest_available_rider
-
+# Logs Setup
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-app = Flask(__name__)
+BOT_TOKEN = "8633846443:AAEx-Pu-IjVnV3Ht7uISDofgRyJmB7nF8z4"
+SUPER_ADMIN_ID = 5552828142
 
-@app.route('/')
-def home():
-    return "Bot is running with Permanent Database!"
+# States for conversation
+REGISTER_VENDOR, REGISTER_RIDER, BROADCAST_MSG = range(3)
 
-def run_flask():
-    app.run(host="0.0.0.0", port=10000)
+# Helper: Distance calculation in KM
+def get_distance(lat1, lon1, lat2, lon2):
+    return geodesic((lat1, lon1), (lat2, lon2)).km
 
-ADD_VENDOR, ADD_RIDER, BROADCAST_MSG = range(3)
+# Helper: Get db session
+def get_db():
+    return SessionLocal()
 
+# Start Command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    conn, db_type = get_connection()
-    cursor = conn.cursor()
+    db = get_db()
     
-    cursor.execute("SELECT status FROM vendors WHERE telegram_id = %s" if db_type == "postgres" else "SELECT status FROM vendors WHERE telegram_id = ?", (user_id,))
-    vendor = cursor.fetchone()
-    
-    cursor.execute("SELECT status, is_online FROM riders WHERE telegram_id = %s" if db_type == "postgres" else "SELECT status, is_online FROM riders WHERE telegram_id = ?", (user_id,))
-    rider = cursor.fetchone()
-    conn.close()
+    # Auto register super admin
+    if user_id == SUPER_ADMIN_ID and not db.query(Admin).filter_by(telegram_id=user_id).first():
+        db.add(Admin(telegram_id=user_id))
+        db.commit()
 
-    if user_id == ADMIN_ID:
-        msg = "👑 **Admin Panel**\n\nCommands:\n/add_vendor - Register Vendor\n/add_rider - Register Rider\n/list_all - Show All Users\n/suspend <id> - Suspend User\n/unsuspend <id> - Active User"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    elif vendor:
-        status = vendor[0] if isinstance(vendor, tuple) else vendor['status']
-        if status == 'suspended':
-            await update.message.reply_text("⛔ Account Suspended.")
-            return
-        kb = [[InlineKeyboardButton("📢 Send Broadcast (5KM)", callback_data="vendor_broadcast")]]
-        await update.message.reply_text("👋 Welcome Vendor! Send any message to dispatch a delivery request.", reply_markup=InlineKeyboardMarkup(kb))
+    rider = db.query(Rider).filter_by(telegram_id=user_id).first()
+    vendor = db.query(Vendor).filter_by(telegram_id=user_id).first()
+    db.close()
+
+    if user_id == SUPER_ADMIN_ID:
+        keyboard = [["/admin_panel"]]
+        await update.message.reply_text("👋 Welcome Admin!", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
     elif rider:
-        status = rider[0] if isinstance(rider, tuple) else rider['status']
-        is_online = rider[1] if isinstance(rider, tuple) else rider['is_online']
-        if status == 'suspended':
-            await update.message.reply_text("⛔ Account Suspended.")
+        if rider.is_suspended:
+            await update.message.reply_text("❌ Your account is suspended.")
             return
-        online_str = "Online 🟢" if is_online else "Offline 🔴"
-        kb = [[InlineKeyboardButton(f"Status: {online_str}", callback_data="toggle_online")]]
-        await update.message.reply_text("🛵 Welcome Rider! Update your location after going Online.", reply_markup=InlineKeyboardMarkup(kb))
+        status = "🔴 Offline" if not rider.is_online else "🟢 Online"
+        keyboard = [["Toggle Online/Offline"], ["Send Location"]]
+        await update.message.reply_text(f"👋 Welcome Rider! Status: {status}", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    elif vendor:
+        if vendor.is_suspended:
+            await update.message.reply_text("❌ Your account is suspended.")
+            return
+        keyboard = [["Send Delivery Request"], ["Broadcast (5km)"]]
+        await update.message.reply_text("👋 Welcome Vendor!", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
     else:
-        await update.message.reply_text("❌ You are not registered.")
+        await update.message.reply_text("You are not registered yet by Admin.")
 
-# --- Admin Operations ---
-async def add_vendor_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("Send format: `TelegramID, Name, Lat, Lon`")
-    return ADD_VENDOR
-
-async def add_vendor_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        tg_id, name, lat, lon = [x.strip() for x in update.message.text.split(',')]
-        conn, db_type = get_connection()
-        cursor = conn.cursor()
-        
-        q = "INSERT INTO vendors (telegram_id, name, lat, lon) VALUES (%s, %s, %s, %s) ON CONFLICT (telegram_id) DO UPDATE SET name=EXCLUDED.name, lat=EXCLUDED.lat, lon=EXCLUDED.lon" if db_type == "postgres" else "INSERT OR REPLACE INTO vendors (telegram_id, name, lat, lon) VALUES (?, ?, ?, ?)"
-        
-        cursor.execute(q, (int(tg_id), name, float(lat), float(lon)))
-        conn.commit()
-        conn.close()
-        await update.message.reply_text("✅ Vendor Permanent Location Saved!")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-    return ConversationHandler.END
-
-async def add_rider_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("Send format: `TelegramID, Name`")
-    return ADD_RIDER
-
-async def add_rider_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        tg_id, name = [x.strip() for x in update.message.text.split(',')]
-        conn, db_type = get_connection()
-        cursor = conn.cursor()
-        
-        q = "INSERT INTO riders (telegram_id, name) VALUES (%s, %s) ON CONFLICT (telegram_id) DO NOTHING" if db_type == "postgres" else "INSERT OR IGNORE INTO riders (telegram_id, name) VALUES (?, ?)"
-        
-        cursor.execute(q, (int(tg_id), name))
-        conn.commit()
-        conn.close()
-        await update.message.reply_text("✅ Rider Registered!")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-    return ConversationHandler.END
-
-async def list_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    conn, db_type = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT telegram_id, name, lat, lon, status FROM vendors")
-    vendors = cursor.fetchall()
-    cursor.execute("SELECT telegram_id, name, is_online, is_busy, status FROM riders")
-    riders = cursor.fetchall()
-    conn.close()
-
-    res = "🏢 **PERMANENT VENDORS:**\n" + "\n".join([f"• {v[0]}: {v[1]} (Lat: {v[2]}, Lon: {v[3]}) [{v[4]}]" for v in vendors])
-    res += "\n\n🛵 **RIDERS:**\n" + "\n".join([f"• {r[0]}: {r[1]} | Online: {r[2]} | Busy: {r[3]} [{r[4]}]" for r in riders])
-    await update.message.reply_text(res, parse_mode="Markdown")
-
-# --- Rider Actions ---
+# Toggle Rider Online Status
 async def toggle_online(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    r_id = query.from_user.id
-    
-    conn, db_type = get_connection()
-    cursor = conn.cursor()
-    
-    q_sel = "SELECT is_online FROM riders WHERE telegram_id = %s" if db_type == "postgres" else "SELECT is_online FROM riders WHERE telegram_id = ?"
-    cursor.execute(q_sel, (r_id,))
-    res = cursor.fetchone()
-    current_status = res[0]
-    
-    new_status = 0 if current_status else 1
-    
-    q_upd = "UPDATE riders SET is_online = %s WHERE telegram_id = %s" if db_type == "postgres" else "UPDATE riders SET is_online = ? WHERE telegram_id = ?"
-    cursor.execute(q_upd, (new_status, r_id))
-    conn.commit()
-    conn.close()
+    user_id = update.effective_user.id
+    db = get_db()
+    rider = db.query(Rider).filter_by(telegram_id=user_id).first()
+    if rider and not rider.is_suspended:
+        rider.is_online = not rider.is_online
+        status = "🟢 Online" if rider.is_online else "🔴 Offline"
+        db.commit()
+        await update.message.reply_text(f"Your status is now: {status}")
+    db.close()
 
-    status_str = "Online 🟢" if new_status else "Offline 🔴"
-    kb = [[InlineKeyboardButton(f"Status: {status_str}", callback_data="toggle_online")]]
-    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(kb))
-    
-    if new_status:
-        await query.message.reply_text("You are ONLINE. Send live location!")
-
+# Update Rider Location
 async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    r_id = update.effective_user.id
-    loc = update.message.location
-    conn, db_type = get_connection()
-    cursor = conn.cursor()
-    
-    q = "UPDATE riders SET lat = %s, lon = %s WHERE telegram_id = %s" if db_type == "postgres" else "UPDATE riders SET lat = ?, lon = ? WHERE telegram_id = ?"
-    cursor.execute(q, (loc.latitude, loc.longitude, r_id))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text("📍 Location updated!")
+    user_id = update.effective_user.id
+    db = get_db()
+    rider = db.query(Rider).filter_by(telegram_id=user_id).first()
+    if rider:
+        rider.latitude = update.message.location.latitude
+        rider.longitude = update.message.location.longitude
+        db.commit()
+        await update.message.reply_text("📍 Location updated successfully!")
+    db.close()
 
-# --- Request Engine & Automatic Timeouts ---
-async def dispatch_request(order_id, context):
-    conn, db_type = get_connection()
-    cursor = conn.cursor()
-    
-    q_ord = "SELECT vendor_id, content, status, rejected_riders FROM orders WHERE order_id = %s" if db_type == "postgres" else "SELECT vendor_id, content, status, rejected_riders FROM orders WHERE order_id = ?"
-    cursor.execute(q_ord, (order_id,))
-    order = cursor.fetchone()
-    
-    if not order or order[2] != 'pending':
-        conn.close()
+# Order Distribution Logic
+async def dispatch_order(app: Application, req_id: int):
+    db = get_db()
+    req = db.query(DeliveryRequest).filter_by(id=req_id).first()
+    if not req or req.status != "PENDING":
+        db.close()
         return
 
-    v_id = order[0]
-    content = order[1]
-    rejected_str = order[3] or ''
-    excluded_ids = [int(x) for x in rejected_str.split(',') if x]
+    vendor = db.query(Vendor).filter_by(telegram_id=req.vendor_id).first()
+    rejected_ids = [int(x) for x in req.rejected_riders.split(",") if x]
 
-    q_ven = "SELECT lat, lon FROM vendors WHERE telegram_id = %s" if db_type == "postgres" else "SELECT lat, lon FROM vendors WHERE telegram_id = ?"
-    cursor.execute(q_ven, (v_id,))
-    vendor = cursor.fetchone()
-    conn.close()
+    # Find closest available online rider within 1km
+    online_riders = db.query(Rider).filter(
+        Rider.is_online == True,
+        Rider.is_busy == False,
+        Rider.is_suspended == False,
+        Rider.telegram_id.not_in(rejected_ids if rejected_ids else [0])
+    ).all()
 
-    if not vendor: return
+    closest_rider = None
+    min_dist = 1.0  # 1 KM max distance for normal request
 
-    rider_id = get_nearest_available_rider(vendor[0], vendor[1], NORMAL_RADIUS_KM, excluded_ids)
+    for rider in online_riders:
+        if rider.latitude and rider.longitude:
+            dist = get_distance(vendor.latitude, vendor.longitude, rider.latitude, rider.longitude)
+            if dist <= min_dist:
+                min_dist = dist
+                closest_rider = rider
 
-    if not rider_id:
-        await context.bot.send_message(v_id, f"⚠️ No available riders found within 1KM.")
-        return
+    if closest_rider:
+        req.current_rider_id = closest_rider.telegram_id
+        db.commit()
 
-    kb = [
-        [InlineKeyboardButton("Accept ✅", callback_data=f"accept_{order_id}"),
-         InlineKeyboardButton("Reject ❌", callback_data=f"reject_{order_id}")]
-    ]
-    
-    msg = await context.bot.send_message(
-        rider_id, 
-        f"📦 **New Delivery Request! (2 Min Timer)**\n\nDetails: {content}", 
-        reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-    )
-
-    asyncio.create_task(auto_timeout_task(order_id, rider_id, msg.message_id, context))
-
-async def auto_timeout_task(order_id, rider_id, msg_id, context):
-    await asyncio.sleep(REQUEST_TIMEOUT)
-    conn, db_type = get_connection()
-    cursor = conn.cursor()
-    
-    q = "SELECT status, rejected_riders FROM orders WHERE order_id = %s" if db_type == "postgres" else "SELECT status, rejected_riders FROM orders WHERE order_id = ?"
-    cursor.execute(q, (order_id,))
-    order = cursor.fetchone()
-
-    if order and order[0] == 'pending':
-        try: await context.bot.delete_message(rider_id, msg_id)
-        except: pass
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Accept", callback_data=f"accept_{req.id}"),
+             InlineKeyboardButton("❌ Reject", callback_data=f"reject_{req.id}")]
+        ])
         
-        rej = (order[1] or '') + f"{rider_id},"
-        q_upd = "UPDATE orders SET rejected_riders = %s WHERE order_id = %s" if db_type == "postgres" else "UPDATE orders SET rejected_riders = ? WHERE order_id = ?"
-        cursor.execute(q_upd, (rej, order_id))
-        conn.commit()
-        conn.close()
+        msg = await app.bot.send_message(
+            chat_id=closest_rider.telegram_id,
+            text=f"📦 **New Delivery Request!**\n\nDistance: {round(min_dist, 2)} KM\nDetails: {req.details}\n\n*You have 90 seconds to respond.*",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+        req.message_id = msg.message_id
+        db.commit()
+
+        # Schedule 90 seconds timeout check
+        app.job_queue.run_once(order_timeout_check, 90, data={"req_id": req.id, "rider_id": closest_rider.telegram_id})
+    else:
+        await app.bot.send_message(chat_id=vendor.telegram_id, text="⚠️ No nearby online riders available at the moment.")
+    
+    db.close()
+
+# Timeout Logic (If rider doesn't click accept/reject within 1-2 mins)
+async def order_timeout_check(context: ContextTypes.DEFAULT_TYPE):
+    job_data = context.job.data
+    req_id = job_data["req_id"]
+    rider_id = job_data["rider_id"]
+
+    db = get_db()
+    req = db.query(DeliveryRequest).filter_by(id=req_id).first()
+
+    if req and req.status == "PENDING" and req.current_rider_id == rider_id:
+        # Delete message from rider inbox
+        try:
+            await context.bot.delete_message(chat_id=rider_id, message_id=req.message_id)
+        except Exception:
+            pass
         
-        await dispatch_request(order_id, context)
+        # Add to rejected and dispatch to next
+        rejected_list = req.rejected_riders.split(",") if req.rejected_riders else []
+        rejected_list.append(str(rider_id))
+        req.rejected_riders = ",".join(rejected_list)
+        req.current_rider_id = None
+        db.commit()
+        db.close()
+
+        # Pass to next rider
+        await dispatch_order(context.application, req_id)
     else:
-        conn.close()
+        db.close()
 
-async def handle_vendor_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    v_id = update.effective_user.id
-    conn, db_type = get_connection()
-    cursor = conn.cursor()
-    
-    q = "SELECT status FROM vendors WHERE telegram_id = %s" if db_type == "postgres" else "SELECT status FROM vendors WHERE telegram_id = ?"
-    cursor.execute(q, (v_id,))
-    vendor = cursor.fetchone()
-    
-    if not vendor or vendor[0] != 'active':
-        conn.close()
-        return
-
-    content = update.message.text
-    if db_type == "postgres":
-        cursor.execute("INSERT INTO orders (vendor_id, content) VALUES (%s, %s) RETURNING order_id", (v_id, content))
-        order_id = cursor.fetchone()[0]
-    else:
-        cursor.execute("INSERT INTO orders (vendor_id, content) VALUES (?, ?)", (v_id, content))
-        order_id = cursor.lastrowid
-
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text(f"Order created! Finding closest rider...")
-    await dispatch_request(order_id, context)
-
-async def handle_order_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Callback Handler for Accept/Reject & Rider Actions
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action, order_id = query.data.split('_')
-    order_id = int(order_id)
-    r_id = query.from_user.id
+    data = query.data.split("_")
+    action = data[0]
+    req_id = int(data[1])
 
-    conn, db_type = get_connection()
-    cursor = conn.cursor()
-    
-    q_ord = "SELECT vendor_id, content, rejected_riders FROM orders WHERE order_id = %s" if db_type == "postgres" else "SELECT vendor_id, content, rejected_riders FROM orders WHERE order_id = ?"
-    cursor.execute(q_ord, (order_id,))
-    order = cursor.fetchone()
+    user_id = query.from_user.id
+    db = get_db()
+    req = db.query(DeliveryRequest).filter_by(id=req_id).first()
+    rider = db.query(Rider).filter_by(telegram_id=user_id).first()
 
-    if not order:
-        conn.close()
+    if not req:
+        await query.edit_message_text("Request no longer exists.")
+        db.close()
         return
 
-    v_id, content, rej_str = order[0], order[1], order[2] or ''
+    if action == "accept" and req.status == "PENDING":
+        req.status = "ACCEPTED"
+        req.accepted_rider_id = user_id
+        rider.is_busy = True
+        db.commit()
 
-    if action == "accept":
-        q1 = "UPDATE orders SET status = 'accepted', rider_id = %s WHERE order_id = %s" if db_type == "postgres" else "UPDATE orders SET status = 'accepted', rider_id = ? WHERE order_id = ?"
-        q2 = "UPDATE riders SET is_busy = 1 WHERE telegram_id = %s" if db_type == "postgres" else "UPDATE riders SET is_busy = 1 WHERE telegram_id = ?"
-        cursor.execute(q1, (r_id, order_id))
-        cursor.execute(q2, (r_id,))
-        conn.commit()
-        
-        kb = [
-            [InlineKeyboardButton("Send to others 🔁", callback_data=f"reassign_{order_id}"),
-             InlineKeyboardButton("Complete ✅", callback_data=f"complete_{order_id}")]
-        ]
-        await query.edit_message_text(f"✅ **Accepted!**\nDetails: {content}", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        await context.bot.send_message(v_id, f"🎉 Rider accepted your order!")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏩ Send to Others", callback_data=f"reassign_{req.id}"),
+             InlineKeyboardButton("✅ Complete Order", callback_data=f"complete_{req.id}")]
+        ])
+        await query.edit_message_text(f"👌 Order Accepted!\nDetails: {req.details}", reply_markup=keyboard)
+        await context.bot.send_message(chat_id=req.vendor_id, text=f"🎉 Rider {rider.name} accepted your delivery request!")
 
-    elif action == "reject":
-        rej = rej_str + f"{r_id},"
-        q = "UPDATE orders SET rejected_riders = %s WHERE order_id = %s" if db_type == "postgres" else "UPDATE orders SET rejected_riders = ? WHERE order_id = ?"
-        cursor.execute(q, (rej, order_id))
-        conn.commit()
-        await query.edit_message_text("Rejected.")
-        conn.close()
-        await dispatch_request(order_id, context)
+    elif action == "reject" and req.status == "PENDING":
+        await query.delete_message()
+        rejected_list = req.rejected_riders.split(",") if req.rejected_riders else []
+        rejected_list.append(str(user_id))
+        req.rejected_riders = ",".join(rejected_list)
+        req.current_rider_id = None
+        db.commit()
+        db.close()
+        await dispatch_order(context.application, req_id)
         return
 
-    elif action == "reassign":
-        rej = rej_str + f"{r_id},"
-        q1 = "UPDATE orders SET status = 'pending', rejected_riders = %s WHERE order_id = %s" if db_type == "postgres" else "UPDATE orders SET status = 'pending', rejected_riders = ? WHERE order_id = ?"
-        q2 = "UPDATE riders SET is_busy = 0 WHERE telegram_id = %s" if db_type == "postgres" else "UPDATE riders SET is_busy = 0 WHERE telegram_id = ?"
-        cursor.execute(q1, (rej, order_id))
-        cursor.execute(q2, (r_id,))
-        conn.commit()
-        await query.edit_message_text("Re-assigned to other riders.")
-        conn.close()
-        await dispatch_request(order_id, context)
+    elif action == "reassign" and req.status == "ACCEPTED":
+        # Rider cannot do it, pass to others
+        req.status = "PENDING"
+        rider.is_busy = False
+        rejected_list = req.rejected_riders.split(",") if req.rejected_riders else []
+        rejected_list.append(str(user_id))
+        req.rejected_riders = ",".join(rejected_list)
+        db.commit()
+
+        await query.edit_message_text("🔄 Order released. Searching for another rider...")
+        db.close()
+        await dispatch_order(context.application, req_id)
         return
 
-    elif action == "complete":
-        q1 = "UPDATE orders SET status = 'completed' WHERE order_id = %s" if db_type == "postgres" else "UPDATE orders SET status = 'completed' WHERE order_id = ?"
-        q2 = "UPDATE riders SET is_busy = 0 WHERE telegram_id = %s" if db_type == "postgres" else "UPDATE riders SET is_busy = 0 WHERE telegram_id = ?"
-        cursor.execute(q1, (order_id,))
-        cursor.execute(q2, (r_id,))
-        conn.commit()
-        await query.edit_message_text("🎉 Completed!")
-        await context.bot.send_message(v_id, f"🏁 Order Completed!")
+    elif action == "complete" and req.status == "ACCEPTED":
+        req.status = "COMPLETED"
+        rider.is_busy = False
+        db.commit()
 
-    conn.close()
+        await query.edit_message_text("✅ Delivery Completed!")
+        await context.bot.send_message(chat_id=req.vendor_id, text="🎉 Your delivery request has been completed!")
 
-# --- Broadcast Logic ---
-async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.message.reply_text("Enter broadcast message (5KM radius):")
-    return BROADCAST_MSG
+    db.close()
 
-async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    v_id = update.effective_user.id
-    text = update.message.text
+# Handle Vendor Normal Delivery Request
+async def vendor_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db = get_db()
+    vendor = db.query(Vendor).filter_by(telegram_id=user_id).first()
+    if not vendor or vendor.is_suspended:
+        db.close()
+        return
+
+    req = DeliveryRequest(vendor_id=user_id, details=update.message.text)
+    db.add(req)
+    db.commit()
+    req_id = req.id
+    db.close()
+
+    await update.message.reply_text("🔎 Finding closest rider (1KM radius)...")
+    await dispatch_order(context.application, req_id)
+
+# Handle Broadcast Request (5KM Radius)
+async def broadcast_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db = get_db()
+    vendor = db.query(Vendor).filter_by(telegram_id=user_id).first()
+    if not vendor or vendor.is_suspended:
+        db.close()
+        return
+
+    text_content = update.message.text.replace("Broadcast:", "").strip()
+    online_riders = db.query(Rider).filter_by(is_online=True, is_suspended=False).all()
     
-    conn, db_type = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT lat, lon FROM vendors WHERE telegram_id = %s" if db_type == "postgres" else "SELECT lat, lon FROM vendors WHERE telegram_id = ?", (v_id,))
-    vendor = cursor.fetchone()
-    
-    cursor.execute("SELECT telegram_id, lat, lon FROM riders WHERE is_online = 1 AND status = 'active'")
-    riders = cursor.fetchall()
-    conn.close()
-
     count = 0
-    if vendor:
-        v_lat, v_lon = vendor[0], vendor[1]
-        for r in riders:
-            r_id, r_lat, r_lon = r[0], r[1], r[2]
-            if r_lat != 0.0 or r_lon != 0.0:
-                dist = calculate_distance(v_lat, v_lon, r_lat, r_lon)
-                if dist <= BROADCAST_RADIUS_KM:
-                    try:
-                        await context.bot.send_message(r_id, f"📢 **5KM BROADCAST:**\n\n{text}", parse_mode="Markdown")
-                        count += 1
-                    except: pass
+    for rider in online_riders:
+        if rider.latitude and rider.longitude:
+            dist = get_distance(vendor.latitude, vendor.longitude, rider.latitude, rider.longitude)
+            if dist <= 5.0: # 5 KM Radius
+                try:
+                    await context.bot.send_message(
+                        chat_id=rider.telegram_id,
+                        text=f"📢 **BROADCAST ANNOUNCEMENT (Within 5KM)**\n\nFrom Vendor: {vendor.name}\nMessage: {text_content}",
+                        parse_mode="Markdown"
+                    )
+                    count += 1
+                except Exception:
+                    pass
 
-    await update.message.reply_text(f"Broadcast sent to {count} riders!")
-    return ConversationHandler.END
+    db.close()
+    await update.message.reply_text(f"📢 Broadcast sent to {count} online riders within 5KM!")
+
+# Admin Commands Panel
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        return
+    msg = (
+        "🛠 **Admin Commands:**\n\n"
+        "`/reg_vendor <ID> <Name> <Lat> <Lon>` - Register Vendor\n"
+        "`/reg_rider <ID> <Name>` - Register Rider\n"
+        "`/list_users` - View All Riders & Vendors\n"
+        "`/suspend <rider/vendor> <ID>` - Suspend User\n"
+        "`/unsuspend <rider/vendor> <ID>` - Unsuspend User\n"
+        "`/remove <rider/vendor> <ID>` - Remove User\n"
+        "`/msg <ID> <text>` - Direct Message User"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def reg_vendor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != SUPER_ADMIN_ID: return
+    try:
+        _, v_id, name, lat, lon = update.message.text.split()
+        db = get_db()
+        v = Vendor(telegram_id=int(v_id), name=name, latitude=float(lat), longitude=float(lon))
+        db.merge(v)
+        db.commit()
+        db.close()
+        await update.message.reply_text("✅ Vendor registered successfully!")
+    except Exception as e:
+        await update.message.reply_text("Format: `/reg_vendor <ID> <Name> <Lat> <Lon>`")
+
+async def reg_rider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != SUPER_ADMIN_ID: return
+    try:
+        _, r_id, name = update.message.text.split()
+        db = get_db()
+        r = Rider(telegram_id=int(r_id), name=name)
+        db.merge(r)
+        db.commit()
+        db.close()
+        await update.message.reply_text("✅ Rider registered successfully!")
+    except Exception:
+        await update.message.reply_text("Format: `/reg_rider <ID> <Name>`")
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != SUPER_ADMIN_ID: return
+    db = get_db()
+    riders = db.query(Rider).all()
+    vendors = db.query(Vendor).all()
+    
+    text = "🚴 **Riders:**\n"
+    for r in riders:
+        text += f"- {r.name} (`{r.telegram_id}`) | Online: {r.is_online} | Suspended: {r.is_suspended}\n"
+    
+    text += "\n🏪 **Vendors:**\n"
+    for v in vendors:
+        text += f"- {v.name} (`{v.telegram_id}`) | Suspended: {v.is_suspended}\n"
+
+    db.close()
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def direct_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != SUPER_ADMIN_ID: return
+    try:
+        parts = update.message.text.split(" ", 2)
+        target_id = int(parts[1])
+        msg_text = parts[2]
+        await context.bot.send_message(chat_id=target_id, text=f"💬 **Admin Message:**\n{msg_text}", parse_mode="Markdown")
+        await update.message.reply_text("Sent!")
+    except Exception:
+        await update.message.reply_text("Format: `/msg <ID> <Text>`")
 
 def main():
     init_db()
-    Thread(target=run_flask, daemon=True).start()
-
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("list_all", list_all))
-
-    admin_conv = ConversationHandler(
-        entry_points=[CommandHandler("add_vendor", add_vendor_start), CommandHandler("add_rider", add_rider_start)],
-        states={
-            ADD_VENDOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_vendor_save)],
-            ADD_RIDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_rider_save)],
-        },
-        fallbacks=[],
-    )
+    app.add_handler(CommandHandler("admin_panel", admin_panel))
+    app.add_handler(CommandHandler("reg_vendor", reg_vendor))
+    app.add_handler(CommandHandler("reg_rider", reg_rider))
+    app.add_handler(CommandHandler("list_users", list_users))
+    app.add_handler(CommandHandler("msg", direct_message))
     
-    broadcast_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(broadcast_start, pattern="^vendor_broadcast$")],
-        states={BROADCAST_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_send)]},
-        fallbacks=[],
-    )
-
-    app.add_handler(admin_conv)
-    app.add_handler(broadcast_conv)
-    app.add_handler(CallbackQueryHandler(toggle_online, pattern="^toggle_online$"))
-    app.add_handler(CallbackQueryHandler(handle_order_action, pattern="^(accept|reject|reassign|complete)_"))
+    app.add_handler(MessageHandler(filters.Regex("^Toggle Online/Offline$"), toggle_online))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vendor_msg))
+    app.add_handler(MessageHandler(filters.Regex("^Broadcast:"), broadcast_request))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, vendor_request))
+    
+    app.add_handler(CallbackQueryHandler(button_handler))
 
+    logging.info("Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+
